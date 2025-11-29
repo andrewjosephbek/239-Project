@@ -113,7 +113,20 @@ def estimate_channel(Y, pilot_subcar, pilot_symbol, N_fft):
     H_real = np.interp(sub_idx, pilot_idx, H_pilots.real)
     H_imag = np.interp(sub_idx, pilot_idx, H_pilots.imag)
     H_est_full = H_real + 1j * H_imag
-    return H_est_full
+
+    # Noise = deviation of each estimate around mean
+    noise = H_pilots_all - H_pilots[None, :]
+    noise_power = np.mean(np.abs(noise)**2)
+
+    # Signal power = mean channel magnitude
+    signal_power = np.mean(np.abs(H_pilots)**2)
+
+    SNR_linear = signal_power / noise_power
+    SNR_dB = 10*np.log10(SNR_linear)
+
+    print(f"Estimated SNR: {SNR_dB:.2f} dB")
+
+    return SNR_dB, H_est_full
 
 
 def equalize_and_ser(M, data_subcar, Y, H_est_full, OFDM_CSTL):
@@ -154,7 +167,7 @@ token = "qF8hsa6U3-U"
 ### OFDM Params
 
 # OFDM payload parameters
-N_sym = 200
+N_sym = 50
 N_fft = 1028 + 1 # must be odd
 N_cp = 16
 
@@ -241,7 +254,7 @@ Y_unshifted = np.fft.fft(rx_no_cp, axis=1)
 Y = np.fft.fftshift(Y_unshifted, axes=1)
 
 ### Channel estimation from pilots
-H_est_full = estimate_channel(Y, pilot_subcar, pilot_symbol, N_fft)
+SNR_dB, H_est_full = estimate_channel(Y, pilot_subcar, pilot_symbol, N_fft)
 
 ### 1-tap equalization and SER
 SER, rx_flat = equalize_and_ser(M, data_subcar, Y, H_est_full, OFDM_CSTL)
@@ -257,9 +270,10 @@ good_bits = good_symbols * bits_per_symbol
 
 tx_time = full_frame_len / fs
 goodput_bps = good_bits / tx_time
+shannon_capacity = fs*np.log2(1+10**(SNR_dB/10))
 
-print(f"Goodput: {goodput_bps/1e6:.4f} mb/s")
-
+print(f"Goodput:            {goodput_bps/1e6:.4f} mb/s")
+print(f"Frac Capacity:      {100*goodput_bps/shannon_capacity:.2f}%")
 
 ### Plots
 fig, axs = plt.subplots(1, 2, figsize=(10, 6))
