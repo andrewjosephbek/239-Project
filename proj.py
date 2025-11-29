@@ -3,28 +3,25 @@ import matplotlib.pyplot as plt
 from scipy.signal import correlate
 from remoteRF.drivers.adalm_pluto import *
 
-# SDR Params 
-# ---------------------------------------------------------
-fs = 1e6                     # baseband sample rate
-fc = 915e6                   # RF center frequency
+### SDR Params 
+fs = 1e6           # baseband sample rate
+fc = 915e6         # RF center frequency
 tx_gain_dB = -20
 rx_gain_dB = 40
 
-# token = "AUuuDnjdT9M" # Loopback
-token = "U8qLuW8Epas" # OTA
+token = "sCBx5l91z7I" 
 
-# OFDM Params
-# ---------------------------------------------------------
+### OFDM Params
 
 # OFDM payload parameters
 N_sym = 200
-N_fft = 128+1
-N_cp = 32
+N_fft = 256+1
+N_cp = 16
 
 # Preamble parameters
 preamble_len = (N_fft+N_cp)*2
 
-# total transmission length in smaples
+# total transmission length in samples
 payload_len = (N_fft+N_cp)*N_sym
 full_frame_len = payload_len + preamble_len
 
@@ -42,10 +39,13 @@ QAM16 = np.array([
      3-3j,  3-1j,  3+1j,  3+3j
 ], dtype=complex)
 
-OFDM_constellation = QAM16
-
 # Normalize to unit average power
 QAM16 /= np.sqrt((np.abs(QAM16)**2).mean())
+
+OFDM_constellation = QAM16.copy()
+
+pilot_symbol = (1+1j)/np.sqrt(2)
+
 
 # DC subcarrier
 dc_idx = N_fft // 2
@@ -57,8 +57,7 @@ pilot_subcar = np.arange(1, N_fft, 2)
 active_subcar = subcars[~np.isin(subcars, dead_subcar)]
 data_subcar = subcars[~np.isin(subcars, np.concatenate((pilot_subcar, dead_subcar)))]
 
-# Initialize SDR
-# ---------------------------------------------------------
+### Initialize SDR
 sdr = adi.Pluto(token=token)
 sdr.sample_rate = int(fs)
 
@@ -78,8 +77,7 @@ sdr.gain_control_mode_chan0 = "manual"
 sdr.rx_hardwaregain_chan0 = rx_gain_dB
 
 
-# Build OFDM style preamble
-# ---------------------------------------------------------
+### Build OFDM style preamble
 
 # Frequency-domain preamble (size N_fft)
 preamble_fd = np.zeros(N_fft, dtype=complex)
@@ -99,15 +97,14 @@ preamble_td = np.concatenate([preamble_td[-N_cp:], preamble_td])
 # Repeat preamble twice for robust correlation
 preamble = np.concatenate([preamble_td, preamble_td])
 
-# Build OFDM Payload
-# ---------------------------------------------------------
+### Build OFDM Payload
 
 # (N_sym x N_fft)  matrix in freq domain
 # (Number of OFDM symbols rows x Number of subcarriers cols)
 M = np.random.choice(OFDM_constellation, size=(N_sym, N_fft))
 
 M[:, dead_subcar] = 0 
-M[:, pilot_subcar] = OFDM_constellation[0]
+M[:, pilot_subcar] = pilot_symbol
 
 X = np.zeros((N_fft + N_cp) * N_sym, dtype=complex)
 
@@ -134,28 +131,26 @@ for s in range(N_sym):
 
 payload = X
 
-# Build full TX frame
-# ---------------------------------------------------------
+### Build full TX frame
 tx_frame = np.concatenate([preamble, payload])
 
 # Scale for Pluto DAC
 tx_scaled = tx_frame / np.max(np.abs(tx_frame)) * (2**14)
 
-# Transmit
-# ---------------------------------------------------------
+### Transmit
+
 sdr.tx(tx_scaled)
 print("Transmitting ...")
 
-# Receive and flush old samples
-# ---------------------------------------------------------
+### Receive and flush old samples
+
 for _ in range(3):
     _ = sdr.rx()
 
 rx = sdr.rx()
 L = len(rx)
 
-# Robust correlation with OFDM preamble
-# ---------------------------------------------------------
+### Correlation with OFDM preamble
 search_len = min(2 * full_frame_len, len(rx))
 corr = correlate(rx[:search_len], preamble, mode="full")
 corr_abs = np.abs(corr)
@@ -178,8 +173,7 @@ if start_index < 0:
 
 print("Detected start_index:", start_index)
 
-# Extract payload safely
-# ---------------------------------------------------------
+### Extract payload safely
 payload_start = start_index + preamble_len
 payload_end = payload_start + payload_len
 
@@ -190,19 +184,16 @@ if payload_end > L:
 else:
     rx_payload = rx[payload_start:payload_end]
 
-# Reshape and remove CP
-# ---------------------------------------------------------
+### Reshape and remove CP
 rx_mat = rx_payload.reshape(N_sym, N_fft + N_cp)
 rx_no_cp = rx_mat[:, N_cp:]
 
-# FFT -> subcarriers
-# ---------------------------------------------------------
+### FFT -> subcarriers
 Y_unshifted = np.fft.fft(rx_no_cp, axis=1)
 Y = np.fft.fftshift(Y_unshifted, axes=1)
 
-# Channel estimation from pilots
-# ---------------------------------------------------------
-pilot_symbol = OFDM_constellation[0]
+### Channel estimation from pilots
+pilot_symbol = pilot_symbol
 Y_pilots = Y[:, pilot_subcar]
 H_pilots_all = Y_pilots / pilot_symbol
 H_pilots = H_pilots_all.mean(axis=0)
@@ -222,26 +213,26 @@ axs[0].set_xlabel("Subcarriers")
 axs[0].set_ylabel("|H|")
 axs[0].grid(True)
 
-# 1 tap equalization
-# ---------------------------------------------------------
+### 1 tap equalization
 eps = 1e-8
 H_safe = np.copy(H_est_full)
 H_safe[np.abs(H_safe) < eps] = eps
 
 Y_eq = Y / H_safe[None, :]
 
-# Compute SER
-# ---------------------------------------------------------
+### Compute SER
 M_data = M[:, data_subcar]
 Y_data = Y_eq[:, data_subcar]
 
 tx_flat = M_data.flatten()
 rx_flat = Y_data.flatten()
 
-rx_dec = np.zeros_like(rx_flat, dtype=complex)
-for i in range(len(rx_flat)):
-    d = np.abs(rx_flat[i] - OFDM_constellation)
-    rx_dec[i] = OFDM_constellation[np.argmin(d)]
+r = rx_flat / np.sqrt(np.mean(np.abs(rx_flat)**2))
+
+rx_dec = np.zeros_like(r, dtype=complex)
+
+dists = np.abs(r[:, None] - OFDM_constellation[None, :])
+rx_dec = OFDM_constellation[np.argmin(dists, axis=1)]
 
 symbol_errors = np.sum(rx_dec != tx_flat)
 SER = symbol_errors / len(tx_flat)
@@ -250,10 +241,15 @@ print(f"Total symbols:      {len(tx_flat)}")
 print(f"Symbol errors:      {symbol_errors}")
 print(f"SER:                {SER:.6f}")
 
-# Constellation Plot
-# ---------------------------------------------------------
+### Constellation Plot
+axs[1].scatter(OFDM_constellation.real,
+               OFDM_constellation.imag,
+               s=40,
+               color="red",
+               marker="x",
+               label="Ideal")
 axs[1].scatter(rx_flat.real, rx_flat.imag, s=4, color="black")
-axs[1].set_title("Equalized Constellation")
+axs[1].set_title(f"Equalized Constellation (M = {len(OFDM_constellation)}, Nc = {len(data_subcar)})")
 axs[1].set_xlabel("I")
 axs[1].set_ylabel("Q")
 axs[1].grid(True)
