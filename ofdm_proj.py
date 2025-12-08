@@ -50,26 +50,29 @@ def build_preamble(N_fft, N_cp, active_subcar, QPSK):
 
 
 def build_payload(N_sym, N_fft, N_cp, OFDM_CSTL, dead_subcar, pilot_subcar, pilot_symbol):
-    # Random data symbols
+
+    # (1) Random OFDM symbols for all OFDM symbols at once
     M = np.random.choice(OFDM_CSTL, size=(N_sym, N_fft))
 
-    # Force DC off and set pilots
+    # (2) Apply DC null + pilots (fully vectorized)
     M[:, dead_subcar] = 0
     M[:, pilot_subcar] = pilot_symbol
 
-    # Time-domain OFDM with CP
-    X = np.zeros((N_fft + N_cp) * N_sym, dtype=complex)
-    idx = 0
+    # (3) IFFT shift all rows at once
+    M_unshift = np.fft.ifftshift(M, axes=1)
 
-    for s in range(N_sym):
-        xf = M[s, :]
-        xf_unshift = np.fft.ifftshift(xf)
-        xt = np.fft.ifft(xf_unshift, n=N_fft)
-        xt_cp = np.concatenate([xt[-N_cp:], xt])
-        X[idx: idx + N_fft + N_cp] = xt_cp
-        idx += N_fft + N_cp
+    # (4) Compute IFFT for all OFDM symbols simultaneously
+    X_no_cp = np.fft.ifft(M_unshift, n=N_fft, axis=1)
+
+    # (5) Add CP vectorized
+    cp = X_no_cp[:, -N_cp:]                    # shape (N_sym, N_cp)
+    X_with_cp = np.concatenate([cp, X_no_cp], axis=1)   # shape (N_sym, N_fft+N_cp)
+
+    # (6) Flatten into single time-domain sequence
+    X = X_with_cp.reshape(-1)
 
     return M, X
+
 
 
 def detect_preamble(rx, preamble, full_frame_len):
@@ -110,21 +113,23 @@ def estimate_channel(Y, pilot_subcar, pilot_symbol, N_fft):
 
     sub_idx = np.arange(N_fft)
     pilot_idx = pilot_subcar
-    H_real = np.interp(sub_idx, pilot_idx, H_pilots.real)
-    H_imag = np.interp(sub_idx, pilot_idx, H_pilots.imag)
-    H_est_full = H_real + 1j * H_imag
+    # H_real = np.interp(sub_idx, pilot_idx, H_pilots.real)
+    # H_imag = np.interp(sub_idx, pilot_idx, H_pilots.imag)
+    # H_est_full = H_real + 1j * H_imag
+    H_mag = np.interp(sub_idx, pilot_idx, np.abs(H_pilots))
+    H_phase = np.interp(sub_idx, pilot_idx, np.angle(H_pilots))
+    H_est_full = H_mag * np.exp(1j * H_phase)
 
-    # Noise = deviation of each estimate around mean
+    # Noise power = channel power variance 
     noise = H_pilots_all - H_pilots[None, :]
     noise_power = np.mean(np.abs(noise)**2)
 
-    # Signal power = mean channel magnitude
     signal_power = np.mean(np.abs(H_pilots)**2)
 
     SNR_linear = signal_power / noise_power
     SNR_dB = 10*np.log10(SNR_linear)
 
-    print(f"Estimated SNR: {SNR_dB:.2f} dB")
+    # print(f"Estimated SNR: {SNR_dB:.2f} dB")
 
     return SNR_dB, H_est_full
 
@@ -152,7 +157,7 @@ def equalize_and_ser(M, data_subcar, Y, H_est_full, OFDM_CSTL):
     symbol_errors = np.sum(rx_dec != tx_flat)
     SER = symbol_errors / len(tx_flat)
 
-    return SER, rx_flat
+    return SER, r
 
 
 #### Main
@@ -162,14 +167,16 @@ fs = 1e6           # baseband sample rate
 fc = 915e6         # RF center frequency
 tx_gain_dB = -20
 rx_gain_dB = 40
-token = "qF8hsa6U3-U" 
+token = "EnNuEIVGpfc" 
 
 ### OFDM Params
 
 # OFDM payload parameters
-N_sym = 50
-N_fft = 1028 + 1 # must be odd
-N_cp = 16
+N_sym = 200
+N_fft = 256 + 1 # must be odd
+N_cp = 6
+pilot_density = 16
+N_guard = 16
 
 # total transmission payload length in samples
 payload_len = (N_fft + N_cp) * N_sym
@@ -183,9 +190,8 @@ QPSK = np.array([
 ], dtype=complex)
 
 QAM16 = generate_qam_constellation(16)
-QAM64 = generate_qam_constellation(64)
 
-OFDM_CSTL = QAM64.copy()
+OFDM_CSTL = QAM16.copy()
 pilot_symbol = (1+1j)/np.sqrt(2)
 
 # DC subcarrier index
@@ -194,8 +200,18 @@ dc_idx = N_fft // 2
 # Subcarrier assignments 
 subcars = np.arange(N_fft)
 dead_subcar = np.array([dc_idx])
-pilot_subcar = np.arange(0, N_fft, 32)
+dead_subcar = np.append(dead_subcar, [subcars[:N_guard], subcars[-N_guard:]])
+
+pilot_subcar = np.arange(0, N_fft, pilot_density)
 pilot_subcar = pilot_subcar[pilot_subcar != dc_idx]
+
+# Estimate the whole channel
+# pilot_subcar = subcars
+# pilot_subcar = pilot_subcar[pilot_subcar != dc_idx]
+# pilot_subcar = pilot_subcar[pilot_subcar != dc_idx+5]
+# pilot_subcar = pilot_subcar[pilot_subcar != dc_idx-5]
+
+
 active_subcar = subcars[~np.isin(subcars, dead_subcar)]
 data_subcar = subcars[~np.isin(subcars, np.concatenate((pilot_subcar, dead_subcar)))]
 
@@ -249,7 +265,7 @@ rx_payload = extract_payload(rx, start_index, preamble_len, payload_len)
 rx_mat = rx_payload.reshape(N_sym, N_fft + N_cp)
 rx_no_cp = rx_mat[:, N_cp:]
 
-### FFT to construct time domain signal
+### FFT to construct freq domain signal
 Y_unshifted = np.fft.fft(rx_no_cp, axis=1)
 Y = np.fft.fftshift(Y_unshifted, axes=1)
 
@@ -262,24 +278,24 @@ SER, rx_flat = equalize_and_ser(M, data_subcar, Y, H_est_full, OFDM_CSTL)
 print(f"Total symbols:      {len(M[:, data_subcar].flatten())}")
 print(f"SER:                {SER*100:.4f} %")
 
-total_symbols = len(data_subcar) * N_sym
-good_symbols  = total_symbols * (1 - SER)
-
-bits_per_symbol = int(np.log2(len(OFDM_CSTL)))
-good_bits = good_symbols * bits_per_symbol
-
-tx_time = full_frame_len / fs
-goodput_bps = good_bits / tx_time
-shannon_capacity = fs*np.log2(1+10**(SNR_dB/10))
-
-print(f"Goodput:            {goodput_bps/1e6:.4f} mb/s")
-print(f"Frac Capacity:      {100*goodput_bps/shannon_capacity:.2f}%")
-
 ### Plots
 fig, axs = plt.subplots(1, 2, figsize=(10, 6))
 
+x = np.linspace(-500, 500, N_fft)
+
 # |H| over subcarriers
-axs[0].plot(np.linspace(-500, 500, N_fft), np.abs(H_est_full))
+axs[0].plot(x, np.abs(H_est_full))
+
+# highlight pilot subcarriers
+pilot_freqs = x[pilot_subcar]
+axs[0].scatter(
+    pilot_freqs,
+    np.abs(H_est_full[pilot_subcar]),
+    color="black",
+    s=20,
+    label="pilots"
+)
+
 axs[0].set_title("|H| over Subcarriers")
 axs[0].set_xlabel("f (kHz)")
 axs[0].set_ylabel("|H|")
